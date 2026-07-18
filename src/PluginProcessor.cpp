@@ -41,7 +41,18 @@ DrumSamplerProcessor::DrumSamplerProcessor()
         "roundRobin", "Round Robin Mix", 0.0f, 1.0f, 0.7f));
 }
 
-DrumSamplerProcessor::~DrumSamplerProcessor() {}
+DrumSamplerProcessor::~DrumSamplerProcessor()
+{
+    kitReady.store(false, std::memory_order_release);
+    waitForAudioCallbacks();
+    sampleEngine->reset();
+}
+
+void DrumSamplerProcessor::waitForAudioCallbacks()
+{
+    while (audioCallbacksInFlight.load(std::memory_order_acquire) > 0)
+        juce::Thread::sleep(1);
+}
 
 bool DrumSamplerProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
@@ -71,6 +82,10 @@ bool DrumSamplerProcessor::canRemoveBus(bool) const
 
 void DrumSamplerProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
+    const bool wasReady = kitReady.exchange(false, std::memory_order_acq_rel);
+    if (wasReady)
+        waitForAudioCallbacks();
+
     currentSampleRate = sampleRate;
     sampleEngine->prepare(sampleRate, samplesPerBlock);
     voiceManager->prepare(sampleRate, samplesPerBlock);
@@ -80,6 +95,9 @@ void DrumSamplerProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     const uint64_t seedMix = static_cast<uint64_t>(juce::Time::getHighResolutionTicks())
                            ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this));
     humanizeRng.seed(static_cast<uint32_t>(seedMix ^ (seedMix >> 32)));
+
+    if (wasReady && sampleEngine->isLoaded())
+        kitReady.store(true, std::memory_order_release);
 }
 
 void DrumSamplerProcessor::releaseResources()
@@ -95,9 +113,19 @@ void DrumSamplerProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     juce::ScopedNoDenormals noDenormals;
     buffer.clear();
 
-    // Acquire-load the gate: the paired release-store in setupInstrumentRouting()
-    // guarantees that, if we see kitReady==true, the instrument-to-bus map and
-    // all sample buffers are fully published to this thread.
+    // Two-step gate. The second check closes the race where the control thread
+    // disables the kit between our first check and incrementing the in-flight
+    // counter. Kit replacement waits for this counter before freeing buffers.
+    if (!kitReady.load(std::memory_order_acquire))
+        return;
+
+    audioCallbacksInFlight.fetch_add(1, std::memory_order_acq_rel);
+    struct AudioCallbackGuard
+    {
+        std::atomic<int>& counter;
+        ~AudioCallbackGuard() { counter.fetch_sub(1, std::memory_order_release); }
+    } audioCallbackGuard{ audioCallbacksInFlight };
+
     if (!kitReady.load(std::memory_order_acquire))
         return;
 
@@ -270,6 +298,7 @@ bool DrumSamplerProcessor::loadDrumKit(const juce::File& kitFile, bool async)
 
     // Close the audio-thread gate before touching any state it reads.
     kitReady.store(false, std::memory_order_release);
+    waitForAudioCallbacks();
 
     // Stop all active voices before unloading previous kit
     voiceManager->reset();
@@ -297,7 +326,7 @@ bool DrumSamplerProcessor::loadDrumKit(const juce::File& kitFile, bool async)
     currentKitPath = kitFile.getFullPathName();
     
     // Configure callback
-    sampleEngine->loadingCallback = [this](bool success)
+    sampleEngine->setLoadingCallback([this](bool success)
     {
         if (success)
         {
@@ -305,17 +334,10 @@ bool DrumSamplerProcessor::loadDrumKit(const juce::File& kitFile, bool async)
             setupInstrumentRouting();
         }
         isLoadingKit = false;
-    };
+    });
     
     // Load new kit (this frees the previous one automatically)
     sampleEngine->loadKit(std::move(kit), async);
-    
-    // If synchronous, update state immediately
-    if (!async)
-    {
-        setupInstrumentRouting();
-        isLoadingKit = false;
-    }
     
     return true;
 }
@@ -323,14 +345,21 @@ bool DrumSamplerProcessor::loadDrumKit(const juce::File& kitFile, bool async)
 bool DrumSamplerProcessor::loadMidiMap(const juce::File& midiMapFile)
 {
     isLoadingMidiMap = true;
-    
+
+    const bool wasReady = kitReady.exchange(false, std::memory_order_acq_rel);
+    if (wasReady)
+        waitForAudioCallbacks();
+
     bool success = sampleEngine->loadMidiMap(midiMapFile);
     if (success)
     {
         currentMidiMapName = midiMapFile.getFileNameWithoutExtension();
         currentMidiMapPath = midiMapFile.getFullPathName();  // Save full path
     }
-    
+
+    if (wasReady && sampleEngine->isLoaded())
+        kitReady.store(true, std::memory_order_release);
+
     isLoadingMidiMap = false;
     return success;
 }
@@ -407,6 +436,7 @@ void DrumSamplerProcessor::setStateInformation(const void* data, int sizeInBytes
                 
                 // Close the audio-thread gate and clear routing before reloading.
                 kitReady.store(false, std::memory_order_release);
+                waitForAudioCallbacks();
                 instrumentToBusMap.clear();
                 instrumentGroups.clear();
                 voiceManager->setInstrumentToBusMap(instrumentToBusMap);
@@ -418,13 +448,10 @@ void DrumSamplerProcessor::setStateInformation(const void* data, int sizeInBytes
                 juce::String midiMapPath = currentMidiMapPath;
                 
                 // Configure callback before loading
-                sampleEngine->loadingCallback = [this, midiMapPath](bool success)
+                sampleEngine->setLoadingCallback([this, midiMapPath](bool success)
                 {
                     if (success)
                     {
-                        // Setup instrument routing after kit is loaded
-                        setupInstrumentRouting();
-                        
                         if (midiMapPath.isNotEmpty())
                         {
                             juce::File midiMapFile(midiMapPath);
@@ -435,10 +462,14 @@ void DrumSamplerProcessor::setStateInformation(const void* data, int sizeInBytes
                                 isLoadingMidiMap = false;
                             }
                         }
+
+                        // Publish routing and open the audio gate only after
+                        // the restored MIDI map is also in place.
+                        setupInstrumentRouting();
                     }
                     
                     isLoadingKit = false;
-                };
+                });
                 
                 voiceManager->reset();
                 

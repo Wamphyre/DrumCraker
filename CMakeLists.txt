@@ -53,15 +53,13 @@ target_compile_definitions(DrumCrakerVST PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_DISPLAY_SPLASH_SCREEN=0
     JUCE_REPORT_APP_USAGE=0
-    JUCE_STANDALONE_APPLICATION=0
     PLUGIN_VERSION="${PLUGIN_VERSION}"
 )
 
 target_link_libraries(DrumCrakerVST 
     PRIVATE
-        juce::juce_audio_utils
+        juce::juce_audio_formats
         juce::juce_audio_processors
         juce::juce_dsp
     PUBLIC
@@ -102,4 +100,17 @@ else()
             target_link_libraries(DrumCrakerVST PRIVATE execinfo)
         endif()
     endif()
+endif()
+
+# Keep direct CMake builds self-contained. Both Linux and macOS VST3 binaries
+# live one directory below Contents, alongside the Resources directory.
+if(TARGET DrumCrakerVST_VST3 AND NOT MSVC)
+    add_custom_command(TARGET DrumCrakerVST_VST3 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:DrumCrakerVST_VST3>/../Resources"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/background.png"
+            "$<TARGET_FILE_DIR:DrumCrakerVST_VST3>/../Resources/background.png"
+        COMMENT "Copying VST3 resources"
+    )
 endif()

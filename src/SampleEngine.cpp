@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 #include <cstring>
+#include <limits>
+#include <unordered_set>
 
 #if JUCE_LINUX
     #include <malloc.h>
@@ -12,34 +14,25 @@ SampleEngine::SampleEngine() {}
 
 SampleEngine::~SampleEngine()
 {
-    // CRITICAL: Signal all threads to stop IMMEDIATELY
-    shouldStopLoading = true;
-    kitLoaded = false;
-    
-    // Wait for any background cache write to finish before destroying buffers
-    waitForCacheWrite();
-    
-    // Clear callback immediately to prevent use-after-free
+    kitLoaded.store(false, std::memory_order_release);
+    shouldStopLoading.store(true, std::memory_order_release);
+
+    // The callback captures the processor. Remove it before joining so a load
+    // finishing during destruction cannot call into an object being destroyed.
     {
         juce::ScopedLock lock(cacheLock);
         loadingCallback = nullptr;
     }
-    
-    // Wait for async loading to finish (with longer timeout for thread pool)
-    int maxWait = 100; // Increased timeout for thread pool cleanup
-    while (isLoadingAsync.load() && maxWait-- > 0)
-    {
-        juce::Thread::sleep(50);
-    }
-    
-    // Force flag to false if timeout
-    isLoadingAsync = false;
-    
-    // Ensure all memory is freed on destruction
-    reset();
+
+    // Never free data while a loader/cache writer may still be using it.
+    stopAndJoinLoadingThread();
+    waitForCacheWrite();
+    clearSampleCaches();
+    instrumentCache.clear();
+    currentKit.reset();
 }
 
-void SampleEngine::prepare(double sr, int samplesPerBlock)
+void SampleEngine::prepare(double sr, int)
 {
     if (sr <= 0.0)
         return;
@@ -50,12 +43,18 @@ void SampleEngine::prepare(double sr, int samplesPerBlock)
                            ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this));
     rrRng.seed(static_cast<uint32_t>(seedMix ^ (seedMix >> 32)));
         
-    // If sample rate changes and we have samples loaded, we MUST resample
+    const double previousSampleRate = sampleRate.exchange(sr, std::memory_order_acq_rel);
+
+    // If sample rate changes and we have samples loaded, we MUST resample.
     // Otherwise render speed will be wrong (pitch shift + sync loss)
-    if (sampleRate > 0.0 && sr != sampleRate && !audioBufferCache.empty())
+    if (previousSampleRate > 0.0 && std::abs(sr - previousSampleRate) > 0.1)
     {
+        // Cache writing reads immutable buffer data without holding cacheLock
+        // for the full write. Finish it before any buffer can be reallocated.
+        waitForCacheWrite();
+
         juce::ScopedLock lock(cacheLock);
-        
+
         // Iterate all buffers and resample in place from their CURRENT rate
         // (bufferSampleRates tracks the rate each buffer is actually stored at)
         // to the NEW target rate. Always resamples from the correct rate, no
@@ -64,72 +63,29 @@ void SampleEngine::prepare(double sr, int samplesPerBlock)
         {
             if (entry.second)
             {
-                double currentRate = bufferSampleRates[entry.first];
+                auto rateIt = bufferSampleRates.find(entry.first);
+                const double currentRate = rateIt != bufferSampleRates.end()
+                                             ? rateIt->second : previousSampleRate;
                 resampleBuffer(*entry.second, currentRate, sr);
                 bufferSampleRates[entry.first] = sr;
             }
         }
     }
-
-    sampleRate = sr;
 }
 
 void SampleEngine::reset()
 {
-    // Signal cancellation FIRST
-    shouldStopLoading = true;
-    kitLoaded = false;
-    
-    // Wait for background cache write to finish (it reads the buffers we're about to free)
-    waitForCacheWrite();
-    
-    // Clear callback safely BEFORE waiting
+    shouldStopLoading.store(true, std::memory_order_release);
+    kitLoaded.store(false, std::memory_order_release);
+
     {
         juce::ScopedLock lock(cacheLock);
         loadingCallback = nullptr;
     }
-    
-    // Wait for async thread to finish (longer timeout for thread pool)
-    int maxWait = 50;
-    while (isLoadingAsync.load() && maxWait-- > 0)
-    {
-        juce::Thread::sleep(50);
-    }
-    
-    // Force flag to false if timeout
-    isLoadingAsync = false;
-    
-    // Lock for cleanup operations
-    juce::ScopedLock lock(cacheLock);
-    
-    // Free audio buffers efficiently
-    for (auto& entry : audioBufferCache)
-    {
-        if (entry.second)
-        {
-            entry.second->setSize(0, 0);
-            entry.second.reset();
-        }
-    }
-    
-    // Clear containers and return memory to OS
-    audioBufferCache.clear();
-    std::unordered_map<juce::String, std::unique_ptr<juce::AudioBuffer<float>>>().swap(audioBufferCache);
 
-    bufferSampleRates.clear();
-    std::unordered_map<juce::String, double>().swap(bufferSampleRates);
-
-    // Clear lock-free cache
-    for (auto& entry : lockFreeBufferCache)
-    {
-        if (entry.second)
-        {
-            entry.second->ready.store(false, std::memory_order_release);
-            entry.second->bufferPtr.store(nullptr, std::memory_order_release);
-        }
-    }
-    lockFreeBufferCache.clear();
-    std::unordered_map<juce::String, std::unique_ptr<LockFreeBufferEntry>>().swap(lockFreeBufferCache);
+    stopAndJoinLoadingThread();
+    waitForCacheWrite();
+    clearSampleCaches();
 
     // Reset lastSampleIndex array (atomic values)
     for (auto& idx : lastSampleIndex)
@@ -147,106 +103,94 @@ void SampleEngine::reset()
     #endif
 }
 
+void SampleEngine::stopAndJoinLoadingThread()
+{
+    shouldStopLoading.store(true, std::memory_order_release);
+
+    if (loadingThread.joinable())
+    {
+        // All callers are owner/control threads. Joining from the loader itself
+        // would be a programming error and would deadlock.
+        jassert(loadingThread.get_id() != std::this_thread::get_id());
+        if (loadingThread.get_id() != std::this_thread::get_id())
+            loadingThread.join();
+    }
+
+    isLoadingAsync.store(false, std::memory_order_release);
+}
+
+void SampleEngine::clearSampleCaches()
+{
+    juce::ScopedLock lock(cacheLock);
+
+    for (auto& entry : lockFreeBufferCache)
+    {
+        if (entry.second)
+        {
+            entry.second->ready.store(false, std::memory_order_release);
+            entry.second->bufferPtr.store(nullptr, std::memory_order_release);
+        }
+    }
+    lockFreeBufferCache.clear();
+    std::unordered_map<juce::String, std::unique_ptr<LockFreeBufferEntry>>().swap(lockFreeBufferCache);
+
+    audioBufferCache.clear();
+    std::unordered_map<juce::String, std::unique_ptr<juce::AudioBuffer<float>>>().swap(audioBufferCache);
+
+    bufferSampleRates.clear();
+    std::unordered_map<juce::String, double>().swap(bufferSampleRates);
+}
+
+void SampleEngine::setLoadingError(const juce::String& message)
+{
+    juce::ScopedLock lock(loadingStatusLock);
+    lastLoadingError = message;
+}
+
+juce::String SampleEngine::getLastLoadingError() const
+{
+    juce::ScopedLock lock(loadingStatusLock);
+    return lastLoadingError;
+}
+
+void SampleEngine::setLoadingCallback(std::function<void(bool)> callback)
+{
+    juce::ScopedLock lock(cacheLock);
+    loadingCallback = std::move(callback);
+}
+
 void SampleEngine::loadKit(std::unique_ptr<DrumKit> kit, bool async)
 {
     if (!kit)
         return;
-    
-    // If we already have a kit loaded
-    if (currentKit && kitLoaded.load())
-    {
-        // If it's the same kit AND samples are loaded, reuse
-        if (currentKit->name == kit->name && !audioBufferCache.empty())
-        {
-            // Update only kit structure (in case something changed)
-            currentKit = std::move(kit);
-            
-            // Call callback immediately since kit is already loaded
-            if (loadingCallback)
-            {
-                auto callback = loadingCallback;
-                loadingCallback = nullptr;
-                callback(true);
-            }
-            return;
-        }
-    }
-    
-    // CRITICAL: If loading a different kit, cancel previous load SAFELY
-    if (isLoadingAsync.load())
-    {
-        // Signal cancellation
-        shouldStopLoading = true;
-        
-        // Clear callback to prevent use-after-free
-        {
-            juce::ScopedLock lock(cacheLock);
-            loadingCallback = nullptr;
-        }
-        
-        // Wait for thread pool to finish (longer timeout)
-        int maxWait = 50;
-        while (isLoadingAsync.load() && maxWait-- > 0)
-        {
-            juce::Thread::sleep(50);
-        }
-        
-        // Force flag to false if timeout
-        isLoadingAsync = false;
-        
-        kitLoaded = false;
-    }
 
-    // Mark as not loaded while we're loading
-    kitLoaded = false;
-
-    // CRITICAL: Signal the cache write thread to abort early (we're about to
-    // discard the old kit's buffers it may still be reading). Then wait for
-    // it to finish BEFORE freeing anything. This prevents use-after-free.
-    shouldStopLoading = true;
-    waitForCacheWrite();
-    shouldStopLoading = false;
-
-    // Now safe to clear old kit data - force memory release
+    // The processor installs the callback before entering this method. Keep it
+    // away from the previous loader while that loader is being cancelled.
+    std::function<void(bool)> pendingCallback;
     {
         juce::ScopedLock lock(cacheLock);
-        
-        // Explicitly free all audio buffers before clearing
-        for (auto& entry : audioBufferCache)
-        {
-            if (entry.second)
-            {
-                entry.second->setSize(0, 0, false, false, false);
-                entry.second.reset();
-            }
-        }
-        
-        // Clear and swap to force memory deallocation
-        audioBufferCache.clear();
-        std::unordered_map<juce::String, std::unique_ptr<juce::AudioBuffer<float>>>().swap(audioBufferCache);
-
-        bufferSampleRates.clear();
-        std::unordered_map<juce::String, double>().swap(bufferSampleRates);
-
-        // Clear lock-free cache
-        for (auto& entry : lockFreeBufferCache)
-        {
-            if (entry.second)
-            {
-                entry.second->ready.store(false, std::memory_order_release);
-                entry.second->bufferPtr.store(nullptr, std::memory_order_release);
-            }
-        }
-        lockFreeBufferCache.clear();
-        std::unordered_map<juce::String, std::unique_ptr<LockFreeBufferEntry>>().swap(lockFreeBufferCache);
-
-        // Reset lastSampleIndex array (atomic values)
-        for (auto& idx : lastSampleIndex)
-            idx.store(0, std::memory_order_relaxed);
-
-        instrumentCache.clear();
-        std::unordered_map<juce::String, Instrument*>().swap(instrumentCache);
+        pendingCallback = std::move(loadingCallback);
+        loadingCallback = nullptr;
     }
+
+    // A display name is not a kit identity. Always finish the previous session
+    // and let the content-addressed disk cache handle fast reloads.
+    stopAndJoinLoadingThread();
+    kitLoaded.store(false, std::memory_order_release);
+
+    // Stop and finish the previous cache writer before freeing its buffers.
+    shouldStopLoading.store(true, std::memory_order_release);
+    waitForCacheWrite();
+    clearSampleCaches();
+
+    for (auto& idx : lastSampleIndex)
+        idx.store(0, std::memory_order_relaxed);
+
+    instrumentCache.clear();
+    std::unordered_map<juce::String, Instrument*>().swap(instrumentCache);
+
+    setLoadingError({});
+    shouldStopLoading.store(false, std::memory_order_release);
 
     // Force memory return to OS (Linux-specific)
     // On macOS/Windows, this does nothing but is harmless
@@ -256,6 +200,11 @@ void SampleEngine::loadKit(std::unique_ptr<DrumKit> kit, bool async)
     
     // Set new kit
     currentKit = std::move(kit);
+
+    {
+        juce::ScopedLock lock(cacheLock);
+        loadingCallback = std::move(pendingCallback);
+    }
     
     // Load samples
     if (async)
@@ -299,167 +248,215 @@ void SampleEngine::loadSamplesAsync()
     if (!currentKit)
         return;
 
-    // Mark that we're loading
-    isLoadingAsync = true;
-    shouldStopLoading = false;
-    
-    // Reset progress counters
-    loadedSampleCount = 0;
-    totalSampleCount = 0;
+    jassert(!loadingThread.joinable());
+    isLoadingAsync.store(true, std::memory_order_release);
+    shouldStopLoading.store(false, std::memory_order_release);
+    loadedSampleCount.store(0, std::memory_order_relaxed);
+    totalSampleCount.store(0, std::memory_order_relaxed);
 
-    juce::Thread::launch([this]()
+    try
     {
-        // CRITICAL: isLoadingAsync MUST be the last thing cleared before the
-        // thread exits. The destructor waits on this flag — if it's cleared
-        // before the thread finishes accessing `this`, the destructor can
-        // destroy the object while the thread is still running.
-        struct ScopeGuard {
-            std::atomic<bool>& flag;
-            ~ScopeGuard() { flag.store(false, std::memory_order_release); }
-        } guard{ isLoadingAsync };
-
-        if (!currentKit || shouldStopLoading.load())
-            return;
-
-        const double targetSR = sampleRate;
-
-        // ---- FASE 2: Try disk cache first (near-instant on hit) ----
-        const uint64_t kitSig = computeKitSignature(*currentKit, targetSR);
-        juce::File cacheFile = getCacheFileForKit(currentKit->kitFile.getFullPathName(), targetSR);
-
-        if (loadFromDiskCache(cacheFile, targetSR, kitSig))
+        loadingThread = std::thread([this]()
         {
-            // Cache hit — samples are ready
-            kitLoaded = true;
+            struct ScopeGuard
+            {
+                std::atomic<bool>& flag;
+                ~ScopeGuard() { flag.store(false, std::memory_order_release); }
+            } guard{ isLoadingAsync };
+
+            if (!currentKit || shouldStopLoading.load(std::memory_order_acquire))
+                return;
+
+            const double targetSR = sampleRate.load(std::memory_order_acquire);
+            const uint64_t kitSig = computeKitSignature(*currentKit, targetSR);
+            const juce::File cacheFile = getCacheFileForKit(
+                currentKit->kitFile.getFullPathName(), targetSR);
+
+            if (loadFromDiskCache(cacheFile, targetSR, kitSig))
+            {
+                if (std::abs(sampleRate.load(std::memory_order_acquire) - targetSR) <= 0.1
+                    && !shouldStopLoading.load(std::memory_order_acquire))
+                {
+                    cacheFile.setLastModificationTime(juce::Time::getCurrentTime());
+                    kitLoaded.store(true, std::memory_order_release);
+
+                    std::function<void(bool)> callback;
+                    {
+                        juce::ScopedLock lock(cacheLock);
+                        callback = std::move(loadingCallback);
+                        loadingCallback = nullptr;
+                    }
+                    if (callback)
+                        callback(true);
+                    return;
+                }
+
+                clearSampleCaches();
+                if (!shouldStopLoading.load(std::memory_order_acquire))
+                {
+                    setLoadingError("Project sample rate changed while the kit was loading; reload the kit");
+                    std::function<void(bool)> callback;
+                    {
+                        juce::ScopedLock lock(cacheLock);
+                        callback = std::move(loadingCallback);
+                        loadingCallback = nullptr;
+                    }
+                    if (callback)
+                        callback(false);
+                }
+                return;
+            }
+
+            if (shouldStopLoading.load(std::memory_order_acquire))
+                return;
+
+            // A failed cache read may have published valid entries before a
+            // truncated/corrupt entry. Start source decoding from a clean set.
+            clearSampleCaches();
+
+            struct FileJob
+            {
+                juce::File file;
+                std::vector<std::pair<int, juce::String>> channels;
+                int64_t workUnits = 1;
+            };
+            std::unordered_map<juce::String, FileJob> jobsByPath;
+
+            for (const auto& instrument : currentKit->instruments)
+            {
+                if (shouldStopLoading.load(std::memory_order_acquire))
+                    return;
+
+                for (const auto& sample : instrument->samples)
+                {
+                    for (const auto& audioSample : sample.audioFiles)
+                    {
+                        const juce::String path = audioSample.audioFile.getFullPathName();
+                        auto& job = jobsByPath[path];
+                        job.file = audioSample.audioFile;
+                        job.workUnits = juce::jmax<int64_t>(1, audioSample.audioFile.getSize());
+
+                        const bool alreadyRequested = std::any_of(
+                            job.channels.begin(), job.channels.end(),
+                            [&](const auto& channel) { return channel.first == audioSample.fileChannel; });
+                        if (!alreadyRequested)
+                        {
+                            job.channels.emplace_back(
+                                audioSample.fileChannel,
+                                path + "_ch" + juce::String(audioSample.fileChannel));
+                        }
+                    }
+                }
+            }
+
+            int64_t totalWork = 0;
+            for (const auto& entry : jobsByPath)
+                totalWork += entry.second.workUnits;
+            totalSampleCount.store(juce::jmax<int64_t>(1, totalWork), std::memory_order_relaxed);
+
+            juce::AudioFormatManager formatManager;
+            formatManager.registerBasicFormats();
+
+            // Decoding is I/O and memory-bandwidth bound. A small fixed ceiling
+            // avoids multiplying large per-file allocations on high-core CPUs.
+            const int numCpus = juce::jmax(1, juce::SystemStats::getNumCpus());
+            const int numThreads = juce::jlimit(1, 4, juce::jmax(1, numCpus / 2));
+            juce::ThreadPool pool(numThreads);
+            std::atomic<bool> hasError{false};
+
+            for (const auto& entry : jobsByPath)
+            {
+                if (shouldStopLoading.load(std::memory_order_acquire))
+                    break;
+
+                const FileJob job = entry.second;
+                pool.addJob([this, job, targetSR, &formatManager, &hasError]()
+                {
+                    if (shouldStopLoading.load(std::memory_order_acquire) || hasError.load())
+                        return;
+
+                    try
+                    {
+                        if (!loadUniqueFile(job.file, job.channels, formatManager,
+                                            targetSR, job.workUnits))
+                        {
+                            if (!shouldStopLoading.load(std::memory_order_acquire))
+                                setLoadingError("Could not decode " + job.file.getFullPathName());
+                            hasError.store(true, std::memory_order_release);
+                        }
+                    }
+                    catch (const std::exception& e)
+                    {
+                        setLoadingError("Error loading " + job.file.getFullPathName()
+                                        + ": " + juce::String(e.what()));
+                        hasError.store(true, std::memory_order_release);
+                    }
+                    catch (...)
+                    {
+                        setLoadingError("Unknown error loading " + job.file.getFullPathName());
+                        hasError.store(true, std::memory_order_release);
+                    }
+                });
+            }
+
+            while (pool.getNumJobs() > 0)
+            {
+                if (shouldStopLoading.load(std::memory_order_acquire))
+                {
+                    // loadUniqueFile checks cancellation between small chunks,
+                    // so an unbounded join is both prompt and lifetime-safe.
+                    pool.removeAllJobs(true, -1);
+                    break;
+                }
+                juce::Thread::sleep(5);
+            }
+            pool.removeAllJobs(true, -1);
+
+            const bool sampleRateChanged =
+                std::abs(sampleRate.load(std::memory_order_acquire) - targetSR) > 0.1;
+            if (sampleRateChanged)
+            {
+                setLoadingError("Project sample rate changed while the kit was loading; reload the kit");
+                hasError.store(true, std::memory_order_release);
+            }
+
+            const bool cancelled = shouldStopLoading.load(std::memory_order_acquire);
+            const bool success = !cancelled && !hasError.load(std::memory_order_acquire);
+            if (success)
+            {
+                kitLoaded.store(true, std::memory_order_release);
+                writeDiskCacheAsync(cacheFile, targetSR, kitSig);
+            }
+            else if (!cancelled)
+            {
+                kitLoaded.store(false, std::memory_order_release);
+                clearSampleCaches();
+            }
 
             std::function<void(bool)> callback;
             {
                 juce::ScopedLock lock(cacheLock);
-                if (loadingCallback)
-                {
-                    callback = loadingCallback;
-                    loadingCallback = nullptr;
-                }
+                callback = std::move(loadingCallback);
+                loadingCallback = nullptr;
             }
-            if (callback && !shouldStopLoading.load())
-                callback(true);
-            return;
-        }
+            if (callback && !cancelled)
+                callback(success);
+        });
+    }
+    catch (const std::exception& e)
+    {
+        isLoadingAsync.store(false, std::memory_order_release);
+        setLoadingError("Could not start loading thread: " + juce::String(e.what()));
 
-        // ---- FASE 1: Cache miss — decode from source files ----
-        // Group all audiofile requests by unique file path so each file is
-        // decoded ONCE and all requested channels are extracted from a single
-        // read. This eliminates the 10-16x redundant decoding of the old
-        // per-channel approach.
-        struct FileJob
-        {
-            juce::File file;
-            std::vector<std::pair<int, juce::String>> channels; // (fileChannel, cacheKey)
-        };
-        std::unordered_map<juce::String, FileJob> jobsByPath;
-
-        for (const auto& instrument : currentKit->instruments)
-        {
-            if (shouldStopLoading.load())
-            {
-                isLoadingAsync = false;
-                return;
-            }
-
-            for (const auto& sample : instrument->samples)
-            {
-                for (const auto& audioSample : sample.audioFiles)
-                {
-                    const juce::String path = audioSample.audioFile.getFullPathName();
-                    auto& job = jobsByPath[path];
-                    job.file = audioSample.audioFile;
-                    job.channels.emplace_back(audioSample.fileChannel,
-                                              path + "_ch" + juce::String(audioSample.fileChannel));
-                }
-            }
-        }
-
-        // Progress is tracked per unique file (not per channel)
-        totalSampleCount = static_cast<int>(jobsByPath.size());
-
-        // Shared format manager (thread-safe for createReaderFor — the format
-        // list is immutable after registration)
-        juce::AudioFormatManager formatManager;
-        formatManager.registerBasicFormats();
-
-        // Use thread pool for parallel loading (90% of available cores)
-        const int numCpus = juce::SystemStats::getNumCpus();
-        const int numThreads = juce::jmax(2, static_cast<int>(numCpus * 0.9f));
-        juce::ThreadPool pool(numThreads);
-        std::atomic<bool> hasError{false};
-
-        for (const auto& kv : jobsByPath)
-        {
-            if (shouldStopLoading.load())
-                break;
-
-            const auto& job = kv.second;
-            // CRITICAL: Capture by value (the map outlives the pool, but be safe)
-            pool.addJob([this, &job, &formatManager, &hasError]()
-            {
-                if (shouldStopLoading.load() || hasError.load())
-                    return;
-                try
-                {
-                    if (!loadUniqueFile(job.file, job.channels, formatManager))
-                        hasError = true;
-                    loadedSampleCount++;
-                }
-                catch (...)
-                {
-                    hasError = true;
-                }
-            });
-        }
-
-        // CRITICAL: Wait for ALL jobs to complete before exiting
-        // This ensures no job is accessing 'this' after destruction
-        while (pool.getNumJobs() > 0)
-        {
-            if (shouldStopLoading.load())
-            {
-                // Cancel remaining jobs but wait for active ones
-                pool.removeAllJobs(true, 5000); // Wait up to 5 seconds
-                break;
-            }
-            juce::Thread::sleep(5);
-        }
-
-        // Ensure pool is fully stopped before continuing
-        pool.removeAllJobs(true, 2000);
-
-        // Only mark as loaded if we completed successfully
-        if (!shouldStopLoading.load() && !hasError.load())
-        {
-            kitLoaded = true;
-
-            // ---- FASE 2: Write disk cache in background (non-blocking) ----
-            writeDiskCacheAsync(cacheFile, targetSR, kitSig);
-        }
-
-        // Call callback if exists (thread-safe)
         std::function<void(bool)> callback;
         {
             juce::ScopedLock lock(cacheLock);
-            if (loadingCallback)
-            {
-                callback = loadingCallback;
-                loadingCallback = nullptr;
-            }
+            callback = std::move(loadingCallback);
+            loadingCallback = nullptr;
         }
-
-        if (callback && !shouldStopLoading.load())
-            callback(!hasError.load());
-
-        // isLoadingAsync is cleared by ScopeGuard at thread exit — AFTER all
-        // access to `this` is complete. This prevents the destructor from
-        // destroying the object while the thread is still running.
-    });
+        if (callback)
+            callback(false);
+    }
 }
 
 void SampleEngine::loadSamplesSync()
@@ -467,7 +464,9 @@ void SampleEngine::loadSamplesSync()
     if (!currentKit)
         return;
 
-    const double targetSR = sampleRate;
+    const double targetSR = sampleRate.load(std::memory_order_acquire);
+    loadedSampleCount.store(0, std::memory_order_relaxed);
+    totalSampleCount.store(0, std::memory_order_relaxed);
 
     // ---- FASE 2: Try disk cache first ----
     const uint64_t kitSig = computeKitSignature(*currentKit, targetSR);
@@ -475,11 +474,20 @@ void SampleEngine::loadSamplesSync()
 
     if (loadFromDiskCache(cacheFile, targetSR, kitSig))
     {
-        kitLoaded = true;
-        if (loadingCallback)
-            loadingCallback(true);
+        kitLoaded.store(true, std::memory_order_release);
+        cacheFile.setLastModificationTime(juce::Time::getCurrentTime());
+        std::function<void(bool)> callback;
+        {
+            juce::ScopedLock lock(cacheLock);
+            callback = std::move(loadingCallback);
+            loadingCallback = nullptr;
+        }
+        if (callback)
+            callback(true);
         return;
     }
+
+    clearSampleCaches();
 
     // ---- FASE 1: Cache miss — decode from source (synchronous) ----
     using ChannelReq = std::pair<int, juce::String>;
@@ -494,27 +502,54 @@ void SampleEngine::loadSamplesSync()
                 const juce::String path = audioSample.audioFile.getFullPathName();
                 auto& job = jobsByPath[path];
                 job.first = audioSample.audioFile;
-                job.second.emplace_back(audioSample.fileChannel,
-                                        path + "_ch" + juce::String(audioSample.fileChannel));
+                const bool alreadyRequested = std::any_of(
+                    job.second.begin(), job.second.end(),
+                    [&](const auto& channel) { return channel.first == audioSample.fileChannel; });
+                if (!alreadyRequested)
+                {
+                    job.second.emplace_back(audioSample.fileChannel,
+                                            path + "_ch" + juce::String(audioSample.fileChannel));
+                }
             }
         }
     }
 
+    int64_t totalWork = 0;
+    for (const auto& entry : jobsByPath)
+        totalWork += juce::jmax<int64_t>(1, entry.second.first.getSize());
+    totalSampleCount.store(juce::jmax<int64_t>(1, totalWork), std::memory_order_relaxed);
+
     juce::AudioFormatManager formatManager;
     formatManager.registerBasicFormats();
 
+    bool success = true;
     for (const auto& kv : jobsByPath)
     {
-        loadUniqueFile(kv.second.first, kv.second.second, formatManager);
+        const int64_t workUnits = juce::jmax<int64_t>(1, kv.second.first.getSize());
+        if (!loadUniqueFile(kv.second.first, kv.second.second, formatManager,
+                            targetSR, workUnits))
+        {
+            setLoadingError("Could not decode " + kv.second.first.getFullPathName());
+            success = false;
+            break;
+        }
     }
 
-    kitLoaded = true;
+    kitLoaded.store(success, std::memory_order_release);
 
-    // Write disk cache in background
-    writeDiskCacheAsync(cacheFile, targetSR, kitSig);
+    if (success)
+        writeDiskCacheAsync(cacheFile, targetSR, kitSig);
+    else
+        clearSampleCaches();
 
-    if (loadingCallback)
-        loadingCallback(true);
+    std::function<void(bool)> callback;
+    {
+        juce::ScopedLock lock(cacheLock);
+        callback = std::move(loadingCallback);
+        loadingCallback = nullptr;
+    }
+    if (callback)
+        callback(success);
 }
 
 // ============================================================================
@@ -523,100 +558,148 @@ void SampleEngine::loadSamplesSync()
 
 bool SampleEngine::loadUniqueFile(const juce::File& audioFile,
                                   const std::vector<std::pair<int, juce::String>>& channels,
-                                  juce::AudioFormatManager& formatManager)
+                                  juce::AudioFormatManager& formatManager,
+                                  double targetSampleRate,
+                                  int64_t progressUnits)
 {
     if (!audioFile.existsAsFile())
         return false;
 
     // Skip channels already cached (e.g., from a partial previous load)
     std::vector<std::pair<int, juce::String>> toLoad;
+    std::unordered_set<int> requestedChannels;
     {
         juce::ScopedLock lock(cacheLock);
         for (const auto& ch : channels)
         {
-            if (audioBufferCache.find(ch.second) == audioBufferCache.end())
+            if (audioBufferCache.find(ch.second) == audioBufferCache.end()
+                && requestedChannels.insert(ch.first).second)
                 toLoad.push_back(ch);
         }
     }
 
     if (toLoad.empty())
+    {
+        loadedSampleCount.fetch_add(progressUnits, std::memory_order_relaxed);
         return true;
+    }
 
     std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(audioFile));
     if (reader == nullptr)
         return false;
 
     const double originalSampleRate = reader->sampleRate;
+    if (reader->lengthInSamples > std::numeric_limits<int>::max())
+        return false;
+
     const int numSamples = static_cast<int>(reader->lengthInSamples);
-    const int numChannels = reader->numChannels;
+    if (reader->numChannels > static_cast<unsigned int>(std::numeric_limits<int>::max()))
+        return false;
+    const int numChannels = static_cast<int>(reader->numChannels);
 
     if (numSamples <= 0 || numChannels <= 0)
         return false;
 
-    // Decode the entire file ONCE into a multichannel buffer.
-    // Uses the correct multi-channel read API (float* const*) instead of the
-    // 2-channel-only read(AudioBuffer*, ..., bool, bool) which silently leaves
-    // channels > 1 as silence for files with more than 2 channels.
-    juce::AudioBuffer<float> fullBuffer(numChannels, numSamples);
-    fullBuffer.clear();
-
-    if (numChannels == 1)
+    struct PendingChannel
     {
-        if (!reader->read(&fullBuffer, 0, numSamples, 0, true, false))
-            return false;
-    }
-    else
-    {
-        // Read ALL channels in one pass — the correct API for >2 channel files
-        std::vector<float*> chanPtrs(numChannels);
-        for (int c = 0; c < numChannels; ++c)
-            chanPtrs[c] = fullBuffer.getWritePointer(c);
+        int fileChannel = 0;
+        juce::String cacheKey;
+        std::unique_ptr<juce::AudioBuffer<float>> buffer;
+    };
+    std::vector<PendingChannel> pendingChannels;
+    pendingChannels.reserve(toLoad.size());
 
-        if (!reader->read(chanPtrs.data(), numChannels, 0, numSamples))
-            return false;
-    }
-
-    // Close the file ASAP (free the file handle)
-    reader.reset();
-
-    // Extract each requested channel into its own mono buffer, resample, and
-    // publish to the caches. Resampling is done OUTSIDE the lock so concurrent
-    // prepare() calls aren't blocked by per-channel DSP work.
     for (const auto& ch : toLoad)
     {
-        const int fileChannel = ch.first;
-        const juce::String& cacheKey = ch.second;
+        if (ch.first < 1 || ch.first > numChannels)
+            return false;
+        pendingChannels.push_back(
+            { ch.first, ch.second,
+              std::make_unique<juce::AudioBuffer<float>>(1, numSamples) });
+    }
 
-        if (fileChannel < 1 || fileChannel > numChannels)
-            continue;
+    // Decode in bounded chunks instead of allocating a second full-size,
+    // multichannel copy of every source file. The destination mono buffers are
+    // the only full-length allocations made for this job.
+    constexpr int decodeChunkSamples = 32768;
+    juce::AudioBuffer<float> decodeBuffer(numChannels,
+        juce::jmin(decodeChunkSamples, numSamples));
+    std::vector<float*> channelPointers(static_cast<size_t>(numChannels));
 
-        auto monoBuffer = std::make_unique<juce::AudioBuffer<float>>(1, numSamples);
-        monoBuffer->copyFrom(0, 0, fullBuffer, fileChannel - 1, 0, numSamples);
+    int sourcePosition = 0;
+    int64_t reportedProgress = 0;
+    const int64_t decodeProgressUnits = (progressUnits * 4) / 5;
+    auto reportProgress = [&](int64_t desiredProgress)
+    {
+        desiredProgress = juce::jlimit<int64_t>(reportedProgress, progressUnits,
+                                                desiredProgress);
+        loadedSampleCount.fetch_add(desiredProgress - reportedProgress,
+                                   std::memory_order_relaxed);
+        reportedProgress = desiredProgress;
+    };
+
+    while (sourcePosition < numSamples)
+    {
+        if (shouldStopLoading.load(std::memory_order_acquire))
+            return false;
+
+        const int samplesThisTime = juce::jmin(decodeChunkSamples, numSamples - sourcePosition);
+        decodeBuffer.setSize(numChannels, samplesThisTime, false, false, true);
+        for (int channel = 0; channel < numChannels; ++channel)
+            channelPointers[static_cast<size_t>(channel)] = decodeBuffer.getWritePointer(channel);
+
+        if (!reader->read(channelPointers.data(), numChannels,
+                          static_cast<int64_t>(sourcePosition), samplesThisTime))
+            return false;
+
+        for (auto& pending : pendingChannels)
+        {
+            pending.buffer->copyFrom(0, sourcePosition, decodeBuffer,
+                                     pending.fileChannel - 1, 0, samplesThisTime);
+        }
+        sourcePosition += samplesThisTime;
+        reportProgress((decodeProgressUnits * sourcePosition) / numSamples);
+    }
+
+    reader.reset();
+
+    for (size_t pendingIndex = 0; pendingIndex < pendingChannels.size(); ++pendingIndex)
+    {
+        auto& pending = pendingChannels[pendingIndex];
+        if (shouldStopLoading.load(std::memory_order_acquire))
+            return false;
 
         // Determine the rate the buffer will be stored at after resampling
         double bufferRate = originalSampleRate;
-        if (sampleRate > 0.0 && std::abs(originalSampleRate - sampleRate) > 0.1)
+        if (targetSampleRate > 0.0
+            && std::abs(originalSampleRate - targetSampleRate) > 0.1)
         {
-            resampleBuffer(*monoBuffer, originalSampleRate, sampleRate);
-            bufferRate = sampleRate;
+            resampleBuffer(*pending.buffer, originalSampleRate, targetSampleRate);
+            bufferRate = targetSampleRate;
         }
 
         // Brief lock just to publish into the caches
         {
             juce::ScopedLock lock(cacheLock);
-            audioBufferCache[cacheKey] = std::move(monoBuffer);
-            bufferSampleRates[cacheKey] = bufferRate;
+            audioBufferCache[pending.cacheKey] = std::move(pending.buffer);
+            bufferSampleRates[pending.cacheKey] = bufferRate;
 
-            auto& lfEntry = lockFreeBufferCache[cacheKey];
+            auto& lfEntry = lockFreeBufferCache[pending.cacheKey];
             if (!lfEntry)
                 lfEntry = std::make_unique<LockFreeBufferEntry>();
 
-            juce::AudioBuffer<float>* bufPtr = audioBufferCache[cacheKey].get();
+            juce::AudioBuffer<float>* bufPtr = audioBufferCache[pending.cacheKey].get();
             lfEntry->bufferPtr.store(bufPtr, std::memory_order_release);
             lfEntry->ready.store(true, std::memory_order_release);
         }
+
+        const int64_t resampleProgressUnits = progressUnits - decodeProgressUnits;
+        reportProgress(decodeProgressUnits
+            + (resampleProgressUnits * static_cast<int64_t>(pendingIndex + 1))
+                / static_cast<int64_t>(pendingChannels.size()));
     }
 
+    reportProgress(progressUnits);
     return true;
 }
 
@@ -679,9 +762,9 @@ void SampleEngine::resampleBuffer(juce::AudioBuffer<float>& buffer,
             juce::FloatVectorOperations::clear(destData + samplesProcessed, newLength - samplesProcessed);
     }
 
-    // Replace original buffer with resampled one
-    buffer.setSize(1, newLength, false, false, false);
-    buffer.copyFrom(0, 0, resampledBuffer, 0, 0, newLength);
+    // Transfer ownership instead of allocating a second destination buffer and
+    // copying the complete resampled signal again.
+    buffer = std::move(resampledBuffer);
 }
 
 // ============================================================================
@@ -764,6 +847,23 @@ uint64_t SampleEngine::computeKitSignature(const DrumKit& kit, double targetSR)
         mix(&size, sizeof(size));
     }
 
+    // Instrument definition XMLs are part of the cache identity: they decide
+    // which source channels are requested even when the audio files themselves
+    // have not changed.
+    std::set<juce::String> definitionPaths;
+    for (const auto& definitionFile : kit.definitionFiles)
+        definitionPaths.insert(definitionFile.getFullPathName());
+
+    for (const auto& path : definitionPaths)
+    {
+        mixStr(path);
+        const juce::File file(path);
+        const int64_t mtime = file.getLastModificationTime().toMilliseconds();
+        const int64_t size = file.getSize();
+        mix(&mtime, sizeof(mtime));
+        mix(&size, sizeof(size));
+    }
+
     // All unique source audio files (sorted for deterministic ordering)
     std::set<juce::String> paths;
     for (const auto& instr : kit.instruments)
@@ -813,8 +913,11 @@ bool SampleEngine::loadFromDiskCache(const juce::File& cacheFile, double expecte
         size_t totalRead = 0;
         while (totalRead < len)
         {
+            const size_t remaining = len - totalRead;
+            const int requestSize = static_cast<int>(std::min<size_t>(
+                remaining, static_cast<size_t>(1024 * 1024)));
             auto bytesRead = in.read(static_cast<char*>(dest) + totalRead,
-                                     static_cast<int>(len - totalRead));
+                                     requestSize);
             if (bytesRead <= 0)
                 return false;
             totalRead += static_cast<size_t>(bytesRead);
@@ -850,6 +953,11 @@ bool SampleEngine::loadFromDiskCache(const juce::File& cacheFile, double expecte
     uint32_t numEntries = 0;
     if (!readExact(&numEntries, 4))
         return false;
+    if (numEntries == 0 || numEntries > 10000000U)
+        return false;
+
+    loadedSampleCount.store(0, std::memory_order_relaxed);
+    totalSampleCount.store(static_cast<int64_t>(numEntries), std::memory_order_relaxed);
 
     // ---- Entries ----
     // Read each entry's data WITHOUT holding cacheLock (disk I/O can take
@@ -864,6 +972,8 @@ bool SampleEngine::loadFromDiskCache(const juce::File& cacheFile, double expecte
         uint32_t keyLen = 0;
         if (!readExact(&keyLen, 4))
             return false;
+        if (keyLen == 0 || keyLen > 1024U * 1024U)
+            return false;
 
         std::string keyBuf(keyLen, '\0');
         if (!readExact(keyBuf.data(), keyLen))
@@ -872,6 +982,9 @@ bool SampleEngine::loadFromDiskCache(const juce::File& cacheFile, double expecte
 
         uint32_t numSamples = 0;
         if (!readExact(&numSamples, 4))
+            return false;
+        if (numSamples == 0
+            || static_cast<uint64_t>(numSamples) > static_cast<uint64_t>(std::numeric_limits<int>::max()))
             return false;
 
         const size_t dataLen = static_cast<size_t>(numSamples) * sizeof(float);
@@ -894,6 +1007,8 @@ bool SampleEngine::loadFromDiskCache(const juce::File& cacheFile, double expecte
             lfEntry->bufferPtr.store(audioBufferCache[cacheKey].get(), std::memory_order_release);
             lfEntry->ready.store(true, std::memory_order_release);
         }
+
+        loadedSampleCount.fetch_add(1, std::memory_order_relaxed);
     }
 
     return true;
@@ -919,68 +1034,106 @@ void SampleEngine::writeDiskCacheAsync(const juce::File& cacheFile, double targe
             ~ScopeGuard() { try { p->set_value(); } catch (...) {} }
         } guard{ promise };
 
-        // Snapshot the list of cache keys under a brief lock.
+        // Only one plugin instance/process may create a cache for this kit and
+        // sample rate at a time.
+        juce::InterProcessLock processLock(
+            "DrumCrakerCache_" + cacheFile.getFileNameWithoutExtension());
+        if (!processLock.enter(0))
+            return;
+
+        struct ProcessLockGuard
+        {
+            juce::InterProcessLock& lock;
+            ~ProcessLockGuard() { lock.exit(); }
+        } processLockGuard{ processLock };
+
+        // Snapshot the list of keys and calculate a conservative upper bound.
         std::vector<juce::String> keys;
+        int64_t rawSizeEstimate = 32;
         {
             juce::ScopedLock lock(cacheLock);
             keys.reserve(audioBufferCache.size());
             for (const auto& kv : audioBufferCache)
+            {
+                if (!kv.second)
+                    continue;
                 keys.push_back(kv.first);
+                rawSizeEstimate += 8 + static_cast<int64_t>(kv.first.getNumBytesAsUTF8());
+                rawSizeEstimate += static_cast<int64_t>(kv.second->getNumSamples())
+                                   * static_cast<int64_t>(sizeof(float));
+            }
         }
 
-        juce::FileOutputStream rawOut(cacheFile);
-        if (!rawOut.openedOk())
+        if (keys.empty() || keys.size() > std::numeric_limits<uint32_t>::max())
             return;
 
-        // GZIP compression — reduces cache file size by ~50-70% compared to
-        // raw float32, cutting disk I/O and space usage dramatically.
-        // Level 1 = fastest (good enough for audio sample data).
-        juce::GZIPCompressorOutputStream out(rawOut, 1);
+        const int64_t cacheLimit = getMaxCacheBytes();
+        const int64_t bytesFree = cacheFile.getParentDirectory().getBytesFreeOnVolume();
+        constexpr int64_t freeSpaceReserve = 512LL * 1024 * 1024;
+        if (rawSizeEstimate > cacheLimit
+            || (bytesFree >= 0 && rawSizeEstimate + freeSpaceReserve > bytesFree))
+            return;
 
-        // Write header (32 bytes) — DCC2 = compressed format
-        const char magic[4] = { 'D', 'C', 'C', '2' };
-        out.write(magic, 4);
-        const uint32_t version = 2;
-        out.write(&version, 4);
-        out.write(&targetSR, 8);
-        out.write(&kitSig, 8);
-        const uint32_t numEntries = static_cast<uint32_t>(keys.size());
-        out.write(&numEntries, 4);
-
-        // Write entries — read directly from the cached buffer under a brief
-        // per-entry lock (NO intermediate copy). This avoids doubling memory
-        // usage during cache write. The lock is held only for the duration of
-        // the sequential write call, which is fast (buffered I/O).
-        for (const auto& key : keys)
+        // Write beside the target and replace it only after GZIP has closed
+        // successfully. Cancellation or a crash leaves the old cache intact.
+        juce::TemporaryFile temporaryFile(cacheFile);
+        bool completed = false;
         {
-            if (shouldStopLoading.load())
-            {
-                out.flush();
+            juce::FileOutputStream rawOut(temporaryFile.getFile());
+            if (!rawOut.openedOk())
                 return;
-            }
-
-            uint32_t numSamples = 0;
-            const float* dataPtr = nullptr;
 
             {
-                juce::ScopedLock lock(cacheLock);
-                auto it = audioBufferCache.find(key);
-                if (it == audioBufferCache.end() || !it->second)
-                    continue; // Buffer was freed (kit changed) — skip
-                numSamples = static_cast<uint32_t>(it->second->getNumSamples());
-                dataPtr = it->second->getReadPointer(0);
+                // Level 1 favours load/write speed over maximum compression.
+                juce::GZIPCompressorOutputStream out(rawOut, 1);
+
+                const char magic[4] = { 'D', 'C', 'C', '2' };
+                const uint32_t version = 2;
+                const uint32_t numEntries = static_cast<uint32_t>(keys.size());
+                if (!out.write(magic, 4)
+                    || !out.write(&version, 4)
+                    || !out.write(&targetSR, 8)
+                    || !out.write(&kitSig, 8)
+                    || !out.write(&numEntries, 4))
+                    return;
+
+                for (const auto& key : keys)
+                {
+                    if (shouldStopLoading.load(std::memory_order_acquire))
+                        return;
+
+                    uint32_t numSamples = 0;
+                    const float* dataPtr = nullptr;
+                    {
+                        juce::ScopedLock lock(cacheLock);
+                        auto it = audioBufferCache.find(key);
+                        if (it == audioBufferCache.end() || !it->second)
+                            return;
+                        numSamples = static_cast<uint32_t>(it->second->getNumSamples());
+                        dataPtr = it->second->getReadPointer(0);
+                    }
+
+                    const std::string keyUtf8 = key.toStdString();
+                    const uint32_t keyLen = static_cast<uint32_t>(keyUtf8.size());
+                    if (!out.write(&keyLen, 4)
+                        || !out.write(keyUtf8.data(), keyLen)
+                        || !out.write(&numSamples, 4)
+                        || !out.write(dataPtr, static_cast<size_t>(numSamples) * sizeof(float)))
+                        return;
+                }
+
+                out.flush();
+                completed = true;
             }
 
-            const std::string keyUtf8 = key.toStdString();
-            const uint32_t keyLen = static_cast<uint32_t>(keyUtf8.size());
-            out.write(&keyLen, 4);
-            out.write(keyUtf8.data(), keyLen);
-            out.write(&numSamples, 4);
-            // Write directly from the cached buffer — no copy, no extra memory
-            out.write(dataPtr, static_cast<size_t>(numSamples) * sizeof(float));
+            rawOut.flush();
+            if (rawOut.getStatus().failed())
+                completed = false;
         }
 
-        out.flush();
+        if (!completed || shouldStopLoading.load(std::memory_order_acquire)
+            || !temporaryFile.overwriteTargetFileWithTemporary())
+            return;
 
         // Prune stale cache files after writing a new one (best-effort,
         // non-blocking, runs at background priority).
@@ -993,6 +1146,16 @@ void SampleEngine::writeDiskCacheAsync(const juce::File& cacheFile, double targe
     }
 }
 
+int64_t SampleEngine::getMaxCacheBytes()
+{
+    constexpr int64_t bytesPerGiB = 1024LL * 1024 * 1024;
+    const juce::String configured = juce::SystemStats::getEnvironmentVariable(
+        "DRUMCRAKER_CACHE_MAX_GB", "20");
+    const int64_t gibibytes = juce::jlimit<int64_t>(
+        1, 1024, static_cast<int64_t>(configured.getLargeIntValue()));
+    return gibibytes * bytesPerGiB;
+}
+
 void SampleEngine::waitForCacheWrite()
 {
     if (cacheWriteFuture.valid())
@@ -1003,7 +1166,7 @@ void SampleEngine::pruneDiskCache()
 {
     // Best-effort cleanup of stale .dcc files. Runs at background priority
     // after a new cache file is written. Removes .dcc files older than 30 days
-    // and enforces a total cache directory size limit of 5 GB (keeps the most
+    // and enforces a configurable total cache directory size limit (keeps the most
     // recently used files). This prevents orphaned cache files from kits that
     // were changed or deleted from accumulating forever.
     juce::Thread::launch(juce::Thread::Priority::background, []()
@@ -1020,7 +1183,7 @@ void SampleEngine::pruneDiskCache()
 
         const juce::Time now = juce::Time::getCurrentTime();
         const int64_t maxAgeMs = 30LL * 24 * 60 * 60 * 1000; // 30 days
-        const int64_t maxTotalBytes = 5LL * 1024 * 1024 * 1024; // 5 GB
+        const int64_t maxTotalBytes = getMaxCacheBytes();
 
         // Phase 1: Remove files older than 30 days
         int64_t totalSize = 0;

@@ -20,13 +20,13 @@
 - **Multi-Channel Output**: 16 Fixed Stereo Buses (Kick, Snare, HH, Toms, Ride, Crash, SFX, Amb...)
 - **DAW Integration**: Buses are named ("Kick", "Snare") for easy mixing in Reaper/Ardour
 - **Velocity Layers**: Automatic sample selection based on MIDI velocity
-- **High-Quality Resampling**: Lagrange interpolation for automatic sample rate conversion
-- **Asynchronous Loading**: Non-blocking sample loading in background thread
+- **Automatic Resampling**: Linear interpolation for 44.1/48 kHz conversion and Lagrange for larger rate changes
+- **Bounded Asynchronous Loading**: Chunked background decoding with cancellation and memory-aware concurrency
 - **Optimized Performance**: Unordered maps and instrument caching for minimal CPU usage
 
 ### Audio Engine
-- **Zero Memory Leaks**: Thread-safe memory management with automatic cleanup
-- **64 Polyphonic Voices**: Simultaneous note playback with intelligent voice stealing
+- **Safe Kit Replacement**: Owned loader threads, cooperative cancellation, and automatic cleanup
+- **128 Polyphonic Voices**: Simultaneous note playback with intelligent voice stealing
 - **Lock-Free Audio Thread**: No allocations or locks in real-time processing
 - **Master Volume Control**: -60dB to +12dB range with smooth gain adjustment
 - **Multi-Bus Rendering**: Efficient per-bus voice rendering with zero overhead in stereo mode
@@ -60,7 +60,7 @@ DrumCraker adds natural human feel to MIDI performances, working with both fixed
 - **OS**: Windows 10 or 11 (64-bit)
 - **Audio**: ASIO, WASAPI, or DirectSound
 - **CPU**: x64 with SSE2 support
-- **RAM**: 4GB minimum (depends on drum kit size)
+- **RAM**: 4GB minimum; large kits require enough RAM for their decoded float32 audio
 - **Compiler**: Visual Studio 2022 with C++ support
 - **Build Tools**: CMake 3.15+, Git
 
@@ -68,7 +68,7 @@ DrumCraker adds natural human feel to MIDI performances, working with both fixed
 - **OS**: Linux (Debian, Ubuntu, Fedora, Arch, etc.)
 - **Audio**: ALSA, JACK, or PipeWire
 - **CPU**: x86_64 with SSE2 support
-- **RAM**: 4GB minimum (depends on drum kit size)
+- **RAM**: 4GB minimum; large kits require enough RAM for their decoded float32 audio
 - **Compiler**: GCC 9+ or Clang 10+ with C++17 support
 - **Build Tools**: CMake 3.15+, Git, pkg-config
 
@@ -76,7 +76,7 @@ DrumCraker adds natural human feel to MIDI performances, working with both fixed
 - **OS**: macOS 12 (Monterey) or later
 - **Audio**: CoreAudio
 - **CPU**: Intel x86_64 or Apple Silicon (M1/M2/M3)
-- **RAM**: 4GB minimum (depends on drum kit size)
+- **RAM**: 4GB minimum; large kits require enough RAM for their decoded float32 audio
 - **Compiler**: Xcode Command Line Tools with C++17 support
 - **Build Tools**: CMake 3.15+, Git
 
@@ -84,7 +84,7 @@ DrumCraker adds natural human feel to MIDI performances, working with both fixed
 - **OS**: FreeBSD 13.0 or later
 - **Audio**: OSS, ALSA (via alsa-lib), or JACK
 - **CPU**: x86_64 with SSE2 support
-- **RAM**: 4GB minimum (depends on drum kit size)
+- **RAM**: 4GB minimum; large kits require enough RAM for their decoded float32 audio
 - **Compiler**: Clang 10+ with C++17 support
 - **Build Tools**: CMake 3.15+, Git, pkg
 - **Note**: LV2 format only (VST3 not currently supported on FreeBSD)
@@ -123,10 +123,9 @@ cd DrumCraker
 
 # Install dependencies (Debian/Ubuntu)
 sudo apt install build-essential cmake git pkg-config \
-    libasound2-dev libfreetype6-dev libfontconfig1-dev \
+    libfreetype6-dev libfontconfig1-dev \
     libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
-    libcurl4-openssl-dev libwebkit2gtk-4.1-dev libgtk-3-dev \
-    libgl1-mesa-dev
+    libgtk-3-dev libgl1-mesa-dev
 
 # Install dependencies (FreeBSD)
 sudo pkg install cmake pkgconf alsa-lib freetype2 libX11 libXext \
@@ -165,6 +164,26 @@ The build process automatically:
 3. **Click "LOAD DRUMKIT"** and select the drum kit XML file
 4. **Click "LOAD MIDI MAP"** and select the MIDI map XML file
 5. **Adjust Master Volume** to your preferred level (default: 0dB)
+
+### Loading Large Kits
+
+DrumCraker currently keeps the decoded kit in RAM. Approximate steady-state memory is:
+
+```text
+sum(sample duration × project sample rate × requested channels × 4 bytes)
+```
+
+FLAC and 16/24-bit WAV files can therefore use substantially more RAM after decoding than their size on disk. Loading is performed in 32K-sample chunks with at most four concurrent decoder jobs, which limits temporary memory spikes, but the complete decoded kit must still fit in memory. Disk streaming is planned for a future release.
+
+The first load decodes and resamples the source files. Later loads can use a validated `.dcc` cache for the current project sample rate. Cache writes are atomic and coordinated between plugin instances.
+
+Cache locations:
+
+- **Windows**: `%LOCALAPPDATA%\DrumCraker\cache`
+- **macOS**: `~/Library/Caches/DrumCraker`
+- **Linux/FreeBSD**: `$XDG_CACHE_HOME/DrumCraker` or `~/.cache/DrumCraker`
+
+The default cache limit is 20 GiB. Set `DRUMCRAKER_CACHE_MAX_GB` before starting the DAW to choose another limit. DrumCraker skips cache creation when the decoded data exceeds the configured limit or the volume does not have enough free space.
 
 ### DrumGizmo Kits
 DrumCraker is compatible with all DrumGizmo drum kits. You can download free kits from:
@@ -244,7 +263,7 @@ This allows you to create a SINGLE template in your DAW that works with ANY Drum
 - **Sample Rate**: Automatic conversion to project sample rate
 - **Buffer Size**: Optimized for 32-512 samples
 - **Latency**: < 1 buffer (< 1.3ms @ 64 samples/48kHz)
-- **Memory**: Zero leaks, efficient cleanup on kit changes
+- **Memory**: Full-kit float32 storage with bounded temporary decode buffers and safe cleanup on kit changes
 - **CPU Usage**: Optimized with hash-based lookups and instrument caching (15-25% reduction vs v1.1.1)
 
 ### Velocity Layer Selection
@@ -255,14 +274,14 @@ This allows you to create a SINGLE template in your DAW that works with ANY Drum
 - Humanization works on top of velocity selection
 
 ### Sample Rate Conversion
-- **Algorithm**: Lagrange 4-point interpolation
-- **Quality**: ~80dB SNR, transparent for musical content
+- **Algorithm**: Linear interpolation for nearby rates (including 44.1↔48 kHz), Lagrange 4-point for larger differences
 - **Performance**: Processed during asynchronous loading
 - **Supported Rates**: Any source rate (44.1kHz, 48kHz, 88.2kHz, 96kHz, etc.)
 
 ## Roadmap
 - [ ] Add compatibility for Hydrogen drumkits (too hard but possible)
 - [ ] MIDI learn for parameter automation
+- [ ] Hybrid attack preloading and disk streaming for kits larger than available RAM
 
 ## Credits
 - **Compatible with**: [DrumGizmo](https://www.drumgizmo.org/) drum kits

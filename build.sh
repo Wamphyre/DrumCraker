@@ -43,15 +43,6 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     if ! pkg-config --exists xcursor; then
         MISSING_DEPS+=("libxcursor-dev")
     fi
-    if ! pkg-config --exists alsa; then
-        MISSING_DEPS+=("libasound2-dev")
-    fi
-    if ! pkg-config --exists libcurl; then
-        MISSING_DEPS+=("libcurl4-openssl-dev")
-    fi
-    if ! pkg-config --exists webkit2gtk-4.1; then
-        MISSING_DEPS+=("libwebkit2gtk-4.1-dev")
-    fi
     if ! pkg-config --exists gtk+-3.0; then
         MISSING_DEPS+=("libgtk-3-dev")
     fi
@@ -129,7 +120,6 @@ else
         -DDRUMCRAKER_ENABLE_NATIVE_OPTIMIZATIONS="$NATIVE_OPTIMIZATIONS"
 fi
 
-# Compile
 # Compile
 echo "Compiling..."
 if [[ "$OSTYPE" == "darwin"* ]]; then

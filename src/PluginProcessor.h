@@ -14,6 +14,7 @@ public:
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
+    using juce::AudioProcessor::processBlock;
     void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
     juce::AudioProcessorEditor* createEditor() override;
@@ -50,6 +51,7 @@ public:
     bool getIsLoadingKit() const { return isLoadingKit.load(); }
     bool getIsLoadingMidiMap() const { return isLoadingMidiMap.load(); }
     float getLoadingProgress() const { return sampleEngine->getLoadingProgress(); }
+    juce::String getLastLoadingError() const { return sampleEngine->getLastLoadingError(); }
     
     // Multi-channel routing
     void setupInstrumentRouting();
@@ -77,6 +79,8 @@ private:
     // Gate for the audio thread: true only when samples AND routing are ready.
     // Written with release after setupInstrumentRouting(); read with acquire in processBlock.
     std::atomic<bool> kitReady{false};
+    std::atomic<int> audioCallbacksInFlight{0};
+    void waitForAudioCallbacks();
 
     // Unique ID to detect project changes
     juce::String stateId;

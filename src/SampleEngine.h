@@ -10,6 +10,7 @@
 #include <utility>
 #include <array>
 #include <future>
+#include <thread>
 
 class SampleEngine
 {
@@ -31,25 +32,30 @@ public:
     const DrumKit* getCurrentKit() const { return currentKit.get(); }
     
     // Loading progress (for UI progress bar)
-    int getLoadedSampleCount() const { return loadedSampleCount.load(); }
-    int getTotalSampleCount() const { return totalSampleCount.load(); }
+    int64_t getLoadedSampleCount() const { return loadedSampleCount.load(); }
+    int64_t getTotalSampleCount() const { return totalSampleCount.load(); }
     float getLoadingProgress() const { 
-        int total = totalSampleCount.load();
-        return total > 0 ? static_cast<float>(loadedSampleCount.load()) / total : 0.0f;
+        int64_t total = totalSampleCount.load();
+        return total > 0 ? juce::jlimit(0.0f, 1.0f,
+            static_cast<float>(loadedSampleCount.load()) / static_cast<float>(total)) : 0.0f;
     }
-    
-    // Callback para notificar cuando termina la carga
-    std::function<void(bool)> loadingCallback;
+    juce::String getLastLoadingError() const;
+    void setLoadingCallback(std::function<void(bool)> callback);
 
 private:
     void loadSamplesAsync();
     void loadSamplesSync();
+    void stopAndJoinLoadingThread();
+    void clearSampleCaches();
+    void setLoadingError(const juce::String& message);
     
     // Fase 1: Decode each unique audio file ONCE, extract all requested channels.
     // `channels` is a list of (fileChannel, cacheKey) pairs to extract from this file.
     bool loadUniqueFile(const juce::File& audioFile,
                         const std::vector<std::pair<int, juce::String>>& channels,
-                        juce::AudioFormatManager& formatManager);
+                        juce::AudioFormatManager& formatManager,
+                        double targetSampleRate,
+                        int64_t progressUnits);
     
     void resampleBuffer(juce::AudioBuffer<float>& buffer, double sourceSampleRate, double targetSampleRate);
     
@@ -61,11 +67,13 @@ private:
     void writeDiskCacheAsync(const juce::File& cacheFile, double targetSR, uint64_t kitSig);
     void waitForCacheWrite();
     void pruneDiskCache();
+    static int64_t getMaxCacheBytes();
     
     std::unique_ptr<DrumKit> currentKit;
     std::atomic<bool> kitLoaded{false};
     std::atomic<bool> isLoadingAsync{false};
     std::atomic<bool> shouldStopLoading{false};
+    std::thread loadingThread;
     
     // Cache de buffers de audio cargados (optimized with unordered_map)
     std::unordered_map<juce::String, std::unique_ptr<juce::AudioBuffer<float>>> audioBufferCache;
@@ -90,10 +98,12 @@ private:
     std::unordered_map<juce::String, Instrument*> instrumentCache;
     
     // Loading progress counters
-    std::atomic<int> loadedSampleCount{0};
-    std::atomic<int> totalSampleCount{0};
+    std::atomic<int64_t> loadedSampleCount{0};
+    std::atomic<int64_t> totalSampleCount{0};
+    mutable juce::CriticalSection loadingStatusLock;
+    juce::String lastLoadingError;
     
-    double sampleRate = 44100.0;
+    std::atomic<double> sampleRate{44100.0};
 
     // Audio-thread RNG for round-robin sample selection (see LockFreeRandom.h).
     LockFreeRandom rrRng;
@@ -108,6 +118,10 @@ private:
 
     // Disk cache write thread handle
     std::future<void> cacheWriteFuture;
+
+    // Called on the loader thread. Access is serialized with cacheLock so a
+    // new load cannot race the completion of the previous one.
+    std::function<void(bool)> loadingCallback;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SampleEngine)
 };

@@ -55,7 +55,10 @@ bool DrumKitLoader::parseKitXML(const juce::File& kitFile, DrumKit& kit)
             auto instrumentFile = kit.basePath.getChildFile(
                 instrumentNode->getStringAttribute("file"));
 
-            if (instrumentFile.existsAsFile() && 
+            if (instrumentFile.existsAsFile())
+                kit.definitionFiles.push_back(instrumentFile);
+
+            if (instrumentFile.existsAsFile() &&
                 parseInstrumentXML(instrumentFile, *instrument))
             {
                 // Parse channel map

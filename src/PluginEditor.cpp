@@ -189,6 +189,17 @@ void DrumSamplerEditor::timerCallback()
         statusLabel.setColour(juce::Label::textColourId, juce::Colour(0xFF00FF00)); // Green
         repaint();
     }
+    else if (!processor.getLastLoadingError().isEmpty())
+    {
+        loadingProgress = 0.0;
+        const juce::String errorText = "Error: " + processor.getLastLoadingError();
+        if (statusLabel.getText() != errorText)
+        {
+            statusLabel.setText(errorText, juce::dontSendNotification);
+            statusLabel.setColour(juce::Label::textColourId, juce::Colour(0xFFFF4040));
+            repaint();
+        }
+    }
 }
 
 void DrumSamplerEditor::updateUIFromProcessor()
@@ -227,7 +238,7 @@ void DrumSamplerEditor::paint(juce::Graphics& g)
     }
     
     // Draw loading progress bar (only when loading)
-    if (loadingProgress > 0.01 && loadingProgress < 0.99)
+    if (loadingProgress > 0.0 && loadingProgress < 1.0)
     {
         auto bounds = getLocalBounds();
         int barWidth = 400;
